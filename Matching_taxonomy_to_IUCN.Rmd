@@ -1,0 +1,286 @@
+---
+title: "Who is Who: Matching taxonomy for mammalian IUCN data to other databases"
+author: "Manuela Gonzalez Suarez and Luis D. Verde Arregoitia"
+date: "13 February 2017"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+#### This script shows how to match the IUCN Red List status data with a species-level database. Here as an example we use the diet database EltonTraits as an example, but the script could be modified relatively easy to match other databases. 
+#### EltonTrait reference: Wilman, H., Belmaker, J., Simpson, J., de la Rosa, C., Rivadeneira, M. M. and Jetz, W. (2014), EltonTraits 1.0: Species-level foraging attributes of the world's birds and mammals. Ecology, 95: 2027. doi:10.1890/13-1917.1 
+#### This blog entry shows the code and includes some additional explanations https://wordpress.com/post/ramblingsofanecologa.wordpress.com/498
+
+#### FIRST: we start by loading and retrieving the necessary R packages and datasets. Using the R package taxize you can actually retrieve the IUCN Red List data directly but you need a personal API so I am not showing that here. You can also download the latest version from IUCN Red List (www.iucn.org). For this example I just uploaded a list obtained on the 5th January 2017 which is available on GitHub (https://github.com/ManuelaGonzalez/Who-is-Who/)
+
+```##
+## Necessary packages
+library(taxize)
+library(stringdist)
+library(rvest)
+library(stringi)
+library(tidyr)
+library(dplyr)
+
+## IUCN Red List (download and tidy-up)
+IUCN <- read.csv("https://raw.githubusercontent.com/ManuelaGonzalez/Who-is-Who/master/Mammals_2017_01_05.csv", stringsAsFactors=FALSE,strip.white=TRUE)
+## Generate full species name
+IUCN$binomial <- paste(IUCN$Genus, IUCN$Species, sep = " ")
+## Tidy-up synonyms list
+IUCN$Synonyms <- gsub("  ", " ", IUCN$Synonyms)
+IUCN$Synonyms <- gsub("<i>", "", IUCN$Synonyms)
+IUCN$Synonyms <- gsub("</i>", "", IUCN$Synonyms)
+
+##In this example this is the database I want to match to IUCN data.
+## EltonTrait database
+EltonTraits_original <- read.table("http://www.esapubs.org/archive/ecol/E095/178/MamFuncDat.txt", sep="\t", stringsAsFactors=FALSE, header=T, strip.white=TRUE)
+EltonTraits <- EltonTraits_original[EltonTraits_original$Scientific!="",] ## There are some empty rows in the downloadable file of EltonTraits, these should be removed
+str(EltonTraits)
+
+## Synomym database as extracted from this website http://www.planet-mammiferes.org/drupal/en/node/20, using code written by Dr. Luis Verde
+
+## scrape page
+fullPage <- read_html("http://www.planet-mammiferes.org/drupal/en/node/37?taxon=1")
+
+## extract node (identified using the selectorgadget browser extension) 
+## note that the scraped hmtl is saved as a string
+synList <- fullPage %>% html_nodes("#main p") %>% toString()
+
+## split strings using the newline html tags, store as matrix
+## make sure the search pattern doesn't need escaping (depending on your OS)
+synListMat <-   stri_split_fixed(synList, "<br>") %>%
+  stri_list2matrix() %>%  as.data.frame()
+
+## split into columns (probably more than needed, just being cautious)
+## the warning message can be ignored
+synSepDF <- separate(synListMat,V1,into = paste("V", 1:9,sep=""), sep = "=")
+
+## which columss are empty
+synSepDF %>%  summarise_each(funs(100*mean(is.na(.))))
+## remove them
+synSepDF <-  synSepDF %>% select(V1:V5)
+
+## clean up the first column (species), based on the tags for boldface
+synSepDF$V1 <-   stri_replace_all_fixed(synSepDF$V1,c("<strong>","</strong>"),"",vectorize_all = FALSE)
+
+## clean up the rows that don't have species names (still html tags in the cells)
+## make sure the regex doesn't need escaping (depending on your OS)
+synTable <- synSepDF %>%  filter(!stri_detect_regex(V1,'\\<'))
+
+## rename columns
+synTable <- synTable %>% rename(species=V1,syn1=V2,syn2=V3,syn3=V4,syn4=V5)
+
+## species and subspecies
+## count words
+synTable$ssp <- stri_count_words(synTable$species)
+## recode
+synTable$subsp <- case_when(synTable$ssp == 2 ~ "species",
+                            synTable$ssp == 3 ~ "subspecies")
+## clean up
+synTable <- synTable %>% select(-ssp)
+## trim whitespace
+Mammal_planet_all <- synTable %>% mutate_all(stri_trim_both)
+## subset and prepare for next step
+## remove last variable that separates taxonomic level
+Mammal_planet <- subset(Mammal_planet_all, subsp=="species")[,1:5] 
+
+## write to disk (optional)
+# write.csv(synTable,file="mammalPLanet.csv")
+
+```
+
+#### SECOND: this is a loop to match species names from EltonTrait to IUCN. It is a presented as a single loop with several steps that could be done separately (that could help for checking mistakes).
+
+```##
+## Create some variables to store information or for checks within loopEltonTraits$IUCN_binomial="no_match"
+EltonTraits$IUCN_binomial="no_match"
+EltonTraits$IUCN_binomial_issues=""
+EltonTraits$IUCN_binomial_source=""
+f1="test" 
+maxDist = 5 ## This value influences the allowed mistmatched in partial matches made with 'amatch' from the library stringdist, can be changed to allow for more or less variation in spelling. 
+
+for (i in 1: nrow(EltonTraits)){
+  ##STEP 1: matches IUCN listed species name or synonym to names in my database of interest (in this example EltonTraits)
+  if (length(grep(EltonTraits$Scientific[i], IUCN$binomial))>0){ 
+    EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(EltonTraits$Scientific[i], IUCN$binomial)]
+    EltonTraits$IUCN_binomial_source[i]="IUCN"}
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") & (length(grep(EltonTraits$Scientific[i], IUCN$Synonyms))==1)) {
+    EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(EltonTraits$Scientific[i], IUCN$Synonyms)]
+    EltonTraits$IUCN_binomial_source[i]="IUCN"}
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") & (length(grep(EltonTraits$Scientific[i], IUCN$Synonyms))>1)) {
+    EltonTraits$IUCN_binomial[i]="multiple_matches"
+    EltonTraits$IUCN_binomial_issues[i]=paste(IUCN$binomial[grep(EltonTraits$Scientific[i], IUCN$Synonyms)], collapse = ';')
+    EltonTraits$IUCN_binomial_source[i]="IUCN"}
+  ##also try partial matches to account for possible mispellings and variants. Names would be listed as partial_match to ensure manual checking as partial matches may not be taxonomically correct. 
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") & (!is.na(amatch(EltonTraits$Scientific[i], IUCN$binomial, maxDist = maxDist)))) { 
+    EltonTraits$IUCN_binomial[i]="partial_match"
+    EltonTraits$IUCN_binomial_issues[i]=paste(IUCN$binomial[amatch(EltonTraits$Scientific[i], IUCN$binomial, maxDist = maxDist)], collapse = ';')
+    EltonTraits$IUCN_binomial_source[i]="IUCN"}
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") & (!is.na(amatch(EltonTraits$Scientific[i], IUCN$Synonyms, maxDist = maxDist)))){
+    EltonTraits$IUCN_binomial[i]="partial_match"
+    EltonTraits$IUCN_binomial_issues[i]=paste(IUCN$binomial[amatch(EltonTraits$Scientific[i], IUCN$Synonyms, maxDist = maxDist)], paste(IUCN$Synonyms[amatch(EltonTraits$Scientific[i], IUCN$Synonyms, maxDist = maxDist)], collapse = ';'), sep = ";")
+    EltonTraits$IUCN_binomial_source[i]="IUCN"}
+  
+  ##STEP 2: matches names not recognized in step 1 with the EoL, Encyclopedia of Life database to identify additional synomyms and possible matches 
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") | (EltonTraits$IUCN_binomial[i]=="partial_match")) {
+    EOL_synonym <- eol_search(EltonTraits$Scientific[i]) 
+    if (!is.na(EOL_synonym[[1]][1])){
+      for (j in 1:nrow(EOL_synonym)){
+        f2 <-f1
+        f1 <-trimws(paste(strsplit(EOL_synonym[j,2], " ")[[1]][1],strsplit(EOL_synonym[j,2], " ")[[1]][2], " ")) ##listed names are often repeated so this is to avoid rematching the same name
+        if (f1!=f2){
+          if (length(grep(f1, IUCN$binomial))>0) {
+            if (EltonTraits$IUCN_binomial[i]=="partial_match"){
+              EltonTraits$IUCN_binomial_issues[i]=""
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(f1, IUCN$binomial)]
+              EltonTraits$IUCN_binomial_source[i]="EOL-Taxize"}
+            if ((EltonTraits$IUCN_binomial[i]!="no_match") & (EltonTraits$IUCN_binomial[i]!=IUCN$binomial[grep(f1, IUCN$binomial)])) {
+              if (EltonTraits$IUCN_binomial_source[i]!="EOL-Taxize"){
+                EltonTraits$IUCN_binomial[i]="multiple_matches"
+                EltonTraits$IUCN_binomial_source[i]= paste(EltonTraits$IUCN_binomial_source[i], "EOL-Taxize", sep = ";")}
+              if (EltonTraits$IUCN_binomial_issues[i]==""){
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i], paste(IUCN$binomial[grep(f1, IUCN$binomial)], collapse = ';'), sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"}
+              if (EltonTraits$IUCN_binomial_issues[i]!="") {
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial_issues[i], paste(IUCN$binomial[grep(f1, IUCN$binomial)],collapse = ';'), sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"}
+            }
+            if (EltonTraits$IUCN_binomial[i]=="no_match"){
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(f1, IUCN$binomial)]
+              EltonTraits$IUCN_binomial_source[i]="EOL-Taxize"}
+          }
+          if (length(grep(f1, IUCN$Synonyms))==1){
+            if (EltonTraits$IUCN_binomial[i]=="partial_match"){
+              EltonTraits$IUCN_binomial_issues[i]=""
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(f1, IUCN$Synonyms)]
+              EltonTraits$IUCN_binomial_source[i]="EOL-Taxize"}
+            if ((EltonTraits$IUCN_binomial[i]!="no_match") & (EltonTraits$IUCN_binomial[i]!=IUCN$binomial[grep(f1, IUCN$Synonyms)])) {
+              if (EltonTraits$IUCN_binomial_source[i]!="EOL-Taxize"){
+                EltonTraits$IUCN_binomial_source[i]= paste(EltonTraits$IUCN_binomial_source[i], "EOL-Taxize", sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"}
+              if (EltonTraits$IUCN_binomial_issues[i]==""){
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i], paste(IUCN$binomial[grep(f1, IUCN$Synonyms)],collapse = ';'), sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"}
+              if (EltonTraits$IUCN_binomial_issues[i]!="") {
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial_issues[i], paste(IUCN$binomial[grep(f1, IUCN$Synonyms)],collapse = ';'), sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"}
+            }
+            if (EltonTraits$IUCN_binomial[i]=="no_match"){
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(f1, IUCN$Synonyms)]
+              EltonTraits$IUCN_binomial_source[i]="EOL-Taxize" } 
+          }
+          if ((length(grep(f1, IUCN$Synonyms))>1) & (EltonTraits$IUCN_binomial[i]=="no_match")){
+            EltonTraits$IUCN_binomial[i]="multiple_matches"
+            EltonTraits$IUCN_binomial_source[i]="EOL-Taxize"
+            EltonTraits$IUCN_binomial_issues[i]=paste(IUCN$binomial[grep(f1, IUCN$Synonyms)],collapse = ';')
+          }
+          if ((length(grep(f1, IUCN$Synonyms))>1) & (EltonTraits$IUCN_binomial[i]!="no_match")){
+            EltonTraits$IUCN_binomial[i]="multiple_matches"
+            EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial_issues[i], paste(IUCN$binomial[grep(f1, IUCN$Synonyms)],collapse = ';'), sep = ";")
+            if (EltonTraits$IUCN_binomial[i]!="partial_match"){
+              EltonTraits$IUCN_binomial_source[i]="EOL-Taxize"}
+            if (EltonTraits$IUCN_binomial_source[i]=="IUCN"){
+              EltonTraits$IUCN_binomial_source[i]="IUCN-partial_EOL-Taxize"}
+          }
+        }
+      }
+    }
+  }
+  
+  ##STEP 3: matches names not recognized in step 2 with the synomym list from website Mammal Planet
+  if ((EltonTraits$IUCN_binomial[i]=="no_match") | (EltonTraits$IUCN_binomial[i]=="partial_match")){
+    for (m in 1:ncol(Mammal_planet)){
+      if (length(grep(EltonTraits$Scientific[i], Mammal_planet[,m]))>0){
+        syno = Mammal_planet[grep(EltonTraits$Scientific[i], Mammal_planet[,m]),-m]
+        for(z in 1:ncol(syno)){
+          if ((syno[z])!="") {
+            if (length(grep(syno[z],IUCN$binomial))>0) {
+              if (EltonTraits$IUCN_binomial[i]=="partial_match") {
+                EltonTraits$IUCN_binomial_issues[i]=paste("partial_IUCN_match", EltonTraits$IUCN_binomial_issues[i],sep = ";")
+                EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(syno[z],IUCN$binomial)]
+                EltonTraits$IUCN_binomial_source[i]="Mammal_Planet_Website"}
+              if ((EltonTraits$IUCN_binomial[i]!="no_match") & (EltonTraits$IUCN_binomial[i]!=IUCN$binomial[grep(syno[z],IUCN$binomial)])){
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i],paste(IUCN$binomial[grep(syno[z],IUCN$binomial)],collapse = ';'),sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"
+                if (EltonTraits$IUCN_binomial_source[i]!="Mammal_Planet_Website"){
+                  EltonTraits$IUCN_binomial_source[i]=paste( EltonTraits$IUCN_binomial_source[i], "Mammal_Planet_Website",sep = ";")}
+              }
+              if (EltonTraits$IUCN_binomial[i]=="no_match"){
+                EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(syno[z],IUCN$binomial)]
+                EltonTraits$IUCN_binomial_source[i]="Mammal_Planet_Website"}
+            }
+            if (length(grep(syno[z],IUCN$Synonyms))>0) {
+              if (EltonTraits$IUCN_binomial[i]=="partial_match") {
+                EltonTraits$IUCN_binomial_issues[i]=paste("partial_IUCN_match", EltonTraits$IUCN_binomial_issues[i],sep = ";")
+                EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(syno[z],IUCN$Synonyms)]
+                EltonTraits$IUCN_binomial_source[i]="Mammal_Planet_Website"}
+              if ((EltonTraits$IUCN_binomial[i]!="no_match") & (EltonTraits$IUCN_binomial[i]!=IUCN$binomial[grep(syno[z],IUCN$Synonyms)])) {
+                EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i],paste(IUCN$binomial[grep(syno[z],IUCN$Synonyms)],collapse = ';'),sep = ";")
+                EltonTraits$IUCN_binomial[i]="multiple_matches"
+                if (EltonTraits$IUCN_binomial_source[i]!="Mammal_Planet_Website"){
+                  EltonTraits$IUCN_binomial_source[i]=paste( EltonTraits$IUCN_binomial_source[i], "Mammal_Planet_Website",sep = ";")}}
+              if (EltonTraits$IUCN_binomial[i]=="no_match"){
+                EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(syno[z],IUCN$Synonyms)]
+                EltonTraits$IUCN_binomial_source[i]="Mammal_Planet_Website"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+##### THIRD: quick summary of issues. Some species may be only partially matched or matched to more than one name. In those cases we see no solution by human intervention. That means, you need to check those taxa and make a decision (to assign one name, to ignore these potential confusion species, to write a paper to clarify taxonomy...)
+
+```##
+EltonTraits %>% filter(IUCN_binomial %in% c("partial_match","multiple_matches")) %>% 
+    count(IUCN_binomial)
+```
+##### EXTRA BITS: for this particular database this additional step was not useful but we have already written the code, so here it is in case you want to run it, we suggest adding to the sequence above as step 4
+
+```##
+## POSSIBLE STEP 4: matches names not recognized in step 3 in the loop above with the ITIS, Integrated Taxonomic Information System, database to identify additional synomyms and possible matches
+#### For this particular example this step does not contribute any matches, but may be worth exploring for different subsets of data. Could be inserted into the loop or run afterwards (as shown here)
+
+for (i in 1: nrow(EltonTraits)){
+  if (EltonTraits$IUCN_binomial[i]=="no_match" | (EltonTraits$IUCN_binomial[i]=="partial_match"){
+    ITIS_synonym <- synonyms(EltonTraits$Scientific[i], db="itis")
+    if (!is.na(ITIS_synonym)){
+      if (ITIS_synonym[[1]][1,3]!="no syns found") {
+        for (k in 1:nrow(ITIS_synonym[[1]][4])){
+          if (length(grep(ITIS_synonym[[1]][k,4], IUCN$binomial))>0){
+            if (EltonTraits$IUCN_binomial[i]=="partial_match") {
+              EltonTraits$IUCN_binomial_issues[i]=paste("partial_IUCN_match", EltonTraits$IUCN_binomial_issues[i],sep = ";")
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$binomial)]}
+            if ((EltonTraits$IUCN_binomial[i]!="no_match") & (EltonTraits$IUCN_binomial[i]!=IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$binomial)]))  {
+              EltonTraits$IUCN_binomial[i]="multiple_matches"
+              EltonTraits$IUCN_binomial_source[i]="itis-Taxize"
+              EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i],paste(IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$binomial)],collapse = ';'))}
+            if (EltonTraits$IUCN_binomial[i]=="no_match"){
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$binomial)]
+              EltonTraits$IUCN_binomial_source[i]="itis-Taxize"}
+          }
+          if (length(grep(ITIS_synonym[[1]][k,4], IUCN$Synonyms))>0) {
+            if (EltonTraits$IUCN_binomial[i]!="no_match"){
+              EltonTraits$IUCN_binomial[i]="multiple_matches"
+              EltonTraits$IUCN_binomial_source[i]="itis-Taxize"
+              EltonTraits$IUCN_binomial_issues[i]=paste(EltonTraits$IUCN_binomial[i],paste(IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$Synonyms)],collapse = ';'))}
+            if (EltonTraits$IUCN_binomial[i]=="no_match"){
+              EltonTraits$IUCN_binomial[i]=IUCN$binomial[grep(ITIS_synonym[[1]][k,4], IUCN$Synonyms)]
+              EltonTraits$IUCN_binomial_source[i]="itis-Taxize"}
+          }
+        }
+      }
+    }
+  }
+}
+
+```
+
+
